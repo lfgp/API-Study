@@ -1,3 +1,4 @@
+#api/app.py
 from flask import Flask, app, request, jsonify
 from flask_cors import CORS
 from core.student import Student
@@ -125,4 +126,5 @@ async def analysis_styles():
         })
 
 if __name__ == '__main__':
+
     app.run(debug=True,port=5000)
