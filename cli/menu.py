@@ -1,3 +1,4 @@
+#cli/menu.py
 import asyncio
 from rich.console import Console
 from rich.table import Table
@@ -225,3 +226,4 @@ async def generate_context_menu(self):
 
     if __name__ == "__main__":
         main()
+
