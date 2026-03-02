@@ -1,3 +1,4 @@
+#core/generator.py
 from openai import OpenAI
 from typing import Dict, Any, Optional
 import asyncio
@@ -105,3 +106,4 @@ class ContentGenerator:
         for content_type, content in comparison.items():
             analysis += f"\n--- {content_type} ---\n{content}\n"
         return analysis
+
