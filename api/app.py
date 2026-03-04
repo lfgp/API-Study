@@ -1,130 +1,176 @@
-#api/app.py
-from flask import Flask, app, request, jsonify
-from flask_cors import CORS
-from core.student import Student
-from core.generator import ContentGenerator
-from storage.jason_handler import JSONHandler
+from __future__ import annotations
+
 import asyncio
-from dotenv import load_dotenv
 import os
-from functools import wraps
+import sys
+from pathlib import Path
+from typing import Any
+
+from dotenv import load_dotenv
+from flask import Flask, jsonify, request
+if __package__ is None or __package__ == "":
+    sys.path.append(str(Path(__file__).resolve().parents[1]))
+
+try:
+    from flask_cors import CORS
+except ModuleNotFoundError:  # pragma: no cover - fallback for minimal test envs
+    def CORS(_app):
+        return None
+
+from core.generator import ContentGenerator
+from core.prompt_engine import CONTENT_TYPES
+from core.student import Student
+from storage.jason_handler import JSONHandler
+
 
 load_dotenv()
 
-config = {
-    "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY"),
-    "STANDARD_MODEL": os.getenv("STANDARD_MODEL")
+app = Flask(__name__)
+CORS(app)
+
+config: dict[str, Any] = {
+    "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY", ""),
+    "OPENAI_ORG_ID": os.getenv("OPENAI_ORG_ID", ""),
+    "OPENAI_BASE_URL": os.getenv("OPENAI_BASE_URL", ""),
+    "STANDARD_MODEL": os.getenv("STANDARD_MODEL", "gpt-4o-mini"),
+    "STANDARD_TEMPERATURE": os.getenv("STANDARD_TEMPERATURE", "0.7"),
+    "STANDARD_MAX_TOKENS": os.getenv("STANDARD_MAX_TOKENS", "1200"),
+    "CACHE_TYPE": os.getenv("CACHE_TYPE", "disk"),
+    "CACHE_DIR": os.getenv("CACHE_DIR", "./cache"),
+    "CACHE_TTL": os.getenv("CACHE_TTL", "3600"),
+    "REDIS_URL": os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+    "DATA_DIR": os.getenv("DATA_DIR", "./data"),
 }
 
 generator = ContentGenerator(config)
-storage = JSONHandler()
+storage = JSONHandler(config["DATA_DIR"])
 
-def async_route(f):
-    "Decorator para permitir rotas assíncronas no Flask"
-    @wraps(f)
-    def wrapped(*args, **kwargs):
-        return asyncio.run(f(*args, **kwargs))
-    return wrapped
 
-@app.route('/api/students', methods=['GET'])
-def students_list():
-    "Retorna a lista de estudantes cadastrados"
-    students = storage.load_students()
-    return jsonify([s.dict() for s in students])
+def _get_student_or_error(student_id: str):
+    data = storage.get_student_by_id(student_id)
+    if not data:
+        return None, (jsonify({"error": "Student not found"}), 404)
+    return Student(**data), None
 
-@app.route('/api/students', methods=['POST'])
+
+@app.route("/", methods=["GET"])
+def health():
+    return jsonify(
+        {
+            "status": "ok",
+            "service": "API-Study",
+            "endpoints": [
+                "GET /api/students",
+                "POST /api/students",
+                "POST /api/generate",
+                "POST /api/generate-all",
+                "POST /api/compare",
+                "GET /api/history",
+            ],
+        }
+    )
+
+
+@app.route("/api/students", methods=["GET"])
+def list_students():
+    return jsonify(storage.load_students())
+
+
+@app.route("/api/students", methods=["POST"])
 def create_student():
-    "Cria um novo estudante a partir dos dados enviados"
-    data = request.json
+    payload = request.json or {}
     try:
-        student = Student(**data)
-        students = storage.load_students()
-        students.append(student.dict())
-        storage.save_students(students)
-        return jsonify(student.dict()), 201
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-    
-@app.route('/api/generate', methods=['POST'])
-@async_route
-async def generate_content():
-    "Gera conteúdo personalizado para um estudante"
-    data = request.json
-    if not all(k in data for k in ['student_id','topic','type']):
-        return jsonify({"error": "Dados incompletos"}), 400
-    
-    student = storage.load_student()
-    student.dict = next((s for s in student if s['id'] == data['student_id']), None)
-    if not student:
-        return jsonify({"error": "Estudante não encontrado"}), 404
+        student = Student(**payload)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
 
-    try:
-        student = Student(**data)
-        valid_types = ['conceptual', 'examples', 'reflection','visual']
-        if data['type'] not in valid_types:
-            return jsonify({"error": f"Tipo inválido. Tipos válidos: {valid_types}"}), 400
-        
-        content = await generator.content_generate(
+    students = storage.load_students()
+    students.append(student.model_dump(mode="json"))
+    storage.save_students(students)
+    return jsonify(student.model_dump(mode="json")), 201
+
+
+@app.route("/api/generate", methods=["POST"])
+def generate_single():
+    payload = request.json or {}
+    required = {"student_id", "topic", "type"}
+    if not required.issubset(payload.keys()):
+        return jsonify({"error": f"Missing fields: {sorted(required)}"}), 400
+
+    if payload["type"] not in CONTENT_TYPES:
+        return jsonify({"error": f"Invalid type. Allowed: {list(CONTENT_TYPES)}"}), 400
+
+    student, error = _get_student_or_error(payload["student_id"])
+    if error:
+        return error
+
+    result = asyncio.run(
+        generator.generate_content(
             student=student,
-            topic=data['topic'],
-            type=data['type'],
-            use_cache=data.get('use_cache', True)
+            topic=payload["topic"],
+            content_type=payload["type"],
+            prompt_version=payload.get("prompt_version", "v1"),
+            use_cache=bool(payload.get("use_cache", True)),
         )
-        return jsonify(content)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-    
-@app.route('/api/compare', methods=['POST'])
-@async_route
-async def compare_prompts():
-    "Compara dois conteúdos gerados para o mesmo tópico"
-    data = request.json
-    if not all(k in data for k in ['student_id','topic']):
-        return jsonify({"error": "Dados incompletos"}), 400
-    
-    student = storage.load_student()
-    student.dict = next((s for s in student if s['id'] == data['student_id']), None)
-    if not student:
-        return jsonify({"error": "Estudante não encontrado"}), 404
+    )
+    return jsonify(result)
 
-    try:
-        student = Student(**student.dict)
-        types = data.get('types', ['conceptual', 'examples', 'reflection','visual'])
-    
-        comparison = generator.generate_comparison(student=student, topic=data['topic'], types=types)
-        return jsonify(comparison)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-    
-@app.route('/api/record', methods=['POST'])
-@async_route
-async def record():
-    "Retorna o histórico de interações de um estudante"
-    student_id = request.json.get('student_id')
-    limit = int(request.json.get('limit', 100))
-    record = storage.get_record_analysis(student_id=student_id, limit=limit)
-    return jsonify({
-        "total": len(record), 
-        "record": record[:limit]
-        })
 
-@app.route('/api/analysis/styles', methods=['POST'])
-@async_route            
-async def analysis_styles():
-    "Análise dos estilos de aprendizagem de um estudante com base em suas interações"
-    record = storage.get_record_analysis()
-    styles = {}
-    for item in record:
-        style = item.get('student', {}).get('style','unknown')
-        if style not in styles:
-            styles[style] = 0
-        styles[style] += 1
+@app.route("/api/generate-all", methods=["POST"])
+def generate_all():
+    payload = request.json or {}
+    required = {"student_id", "topic"}
+    if not required.issubset(payload.keys()):
+        return jsonify({"error": f"Missing fields: {sorted(required)}"}), 400
 
-    return jsonify({
-        "styles_distribuiton": styles,
-        "total_versions": len(record)
-        })
+    student, error = _get_student_or_error(payload["student_id"])
+    if error:
+        return error
 
-if __name__ == '__main__':
+    result = asyncio.run(
+        generator.generate_all_types(
+            student=student,
+            topic=payload["topic"],
+            prompt_version=payload.get("prompt_version", "v1"),
+            use_cache=bool(payload.get("use_cache", True)),
+        )
+    )
+    return jsonify(result)
 
-    app.run(debug=True,port=5000)
+
+@app.route("/api/compare", methods=["POST"])
+def compare_versions():
+    payload = request.json or {}
+    required = {"student_id", "topic", "type"}
+    if not required.issubset(payload.keys()):
+        return jsonify({"error": f"Missing fields: {sorted(required)}"}), 400
+
+    if payload["type"] not in CONTENT_TYPES:
+        return jsonify({"error": f"Invalid type. Allowed: {list(CONTENT_TYPES)}"}), 400
+
+    student, error = _get_student_or_error(payload["student_id"])
+    if error:
+        return error
+
+    versions = tuple(payload.get("versions", ["v1", "v2"]))
+    result = asyncio.run(
+        generator.compare_prompt_versions(
+            student=student,
+            topic=payload["topic"],
+            content_type=payload["type"],
+            versions=versions,
+            use_cache=bool(payload.get("use_cache", False)),
+        )
+    )
+    return jsonify(result)
+
+
+@app.route("/api/history", methods=["GET"])
+def history():
+    student_id = request.args.get("student_id")
+    limit = int(request.args.get("limit", 50))
+    return jsonify(storage.get_generation_history(student_id=student_id, limit=limit))
+
+
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)
