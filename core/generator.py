@@ -1,109 +1,167 @@
-#core/generator.py
-from openai import OpenAI
-from typing import Dict, Any, Optional
-import asyncio
+from __future__ import annotations
+
+from typing import Any, Dict, Iterable
+
+from openai import AsyncOpenAI
+
+from .prompt_engine import CONTENT_TYPES, PromptEngine
 from .student import Student
-from .prompt_engine import PromptEngine
 from storage.cache_manager import CacheManager
-from storage.jason_handler import JasonHandler
-import logging
-from datetime import datetime
-import os
+from storage.jason_handler import JSONHandler
+
 
 class ContentGenerator:
     def __init__(self, config: Dict[str, Any]):
-        self.client = OpenAI(
-            api_key=config["OPENAI_API_KEY"]
-            organization=config.get("OPENAI_ORGANIZATION")
-            base_url=config.get("OPENAI_BASE_URL")
-            )
-        self.model = config["STANDARD_MODEL"]
-        self.fallback_model = config.get("FALLBACK_MODEL", "gpt-3.5-turbo")
-        self.temperature = config.get("TEMPERATURE", 0.7)
-        self.max_tokens = config.get("MAX_TOKENS", 2000)
-        self.cache_manager = CacheManager(config)
-        self.storage = JasonHandler(config)
-        self.logger = logging.getLogger(__name__)
-        logging.basicConfig(level=logging.INFO)
+        self.config = config
+        self.model = config.get("STANDARD_MODEL", "gpt-4o-mini")
+        self.temperature = float(config.get("STANDARD_TEMPERATURE", 0.7))
+        self.max_tokens = int(config.get("STANDARD_MAX_TOKENS", 1200))
+        self.client = AsyncOpenAI(
+            api_key=config.get("OPENAI_API_KEY"),
+            organization=config.get("OPENAI_ORG_ID") or None,
+            base_url=config.get("OPENAI_BASE_URL") or None,
+        )
+        self.cache = CacheManager(config)
+        self.storage = JSONHandler(config.get("DATA_DIR", "./data"))
 
-    async def generate_content(self, student: Student, topic: str, type: str, user_cache: bool = True) -> Dict[str, Any]:
-        """Gera conteúdo personalizado para um estudante com base em seu perfil e preferências."""
-        cache_key = f"{student.id}_{topic}_{type}"
-        if user_cache:
-            cached_content = self.cache_manager.get(cache_key)
-            if cached_content and user_cache:
-                logging.info(f"Cache hit for {cache_key}")
-                return cached_content
-        
-        logging.info(f"Cache miss for {cache_key}. Generating new content.")
-        engine = PromptEngine(student, topic, type)
-        prompts ={
-            "context": engine.generate_context_prompt(),
-            "exercise": engine.generate_exercise_prompt(),
-            "reflection": engine.generate_reflection_prompt(),
-            "visual": engine.generate_visual_prompt()
+    async def generate_content(
+        self,
+        student: Student,
+        topic: str,
+        content_type: str,
+        prompt_version: str = "v1",
+        use_cache: bool = True,
+    ) -> Dict[str, Any]:
+        if content_type not in CONTENT_TYPES:
+            raise ValueError(f"Invalid content_type '{content_type}'. Use one of: {CONTENT_TYPES}")
+
+        engine = PromptEngine(student=student, topic=topic, prompt_version=prompt_version)
+        messages = engine.build_messages(content_type)
+        cache_key = CacheManager.make_key(student.id, topic, content_type, prompt_version, self.model)
+
+        if use_cache:
+            cached = self.cache.get(cache_key)
+            if cached is not None:
+                result = {
+                    "student_id": student.id,
+                    "topic": topic,
+                    "content_type": content_type,
+                    "prompt_version": prompt_version,
+                    "model": self.model,
+                    "used_cache": True,
+                    "response": cached,
+                }
+                self.storage.save_generation(
+                    student_id=student.id,
+                    topic=topic,
+                    content_type=content_type,
+                    prompt_version=prompt_version,
+                    model=self.model,
+                    prompt_messages=messages,
+                    response_text=cached,
+                    used_cache=True,
+                )
+                return result
+
+        completion = await self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+        )
+        response_text = completion.choices[0].message.content.strip()
+
+        self.cache.set(cache_key, response_text)
+        self.storage.save_generation(
+            student_id=student.id,
+            topic=topic,
+            content_type=content_type,
+            prompt_version=prompt_version,
+            model=self.model,
+            prompt_messages=messages,
+            response_text=response_text,
+            used_cache=False,
+        )
+
+        return {
+            "student_id": student.id,
+            "topic": topic,
+            "content_type": content_type,
+            "prompt_version": prompt_version,
+            "model": self.model,
+            "used_cache": False,
+            "response": response_text,
         }
-        try:
-            prompt = prompts.get(type)
-            if not prompt:
-                raise ValueError(f"Prompt type '{type}' not supported")
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "system", "content": "You are an educational assistant."},
-                          {"role": "user", "content": prompt}]
+
+    async def generate_all_types(
+        self,
+        student: Student,
+        topic: str,
+        prompt_version: str = "v1",
+        use_cache: bool = True,
+    ) -> Dict[str, Any]:
+        results: Dict[str, Dict[str, Any]] = {}
+        for content_type in CONTENT_TYPES:
+            results[content_type] = await self.generate_content(
+                student=student,
+                topic=topic,
+                content_type=content_type,
+                prompt_version=prompt_version,
+                use_cache=use_cache,
             )
-            content = response.choices[0].message.content.strip()
-            self.cache_manager.set(cache_key, content)
-            self.storage.save_record({
-                "student_id": student.id,
-                "topic": topic,
-                "type": content_type,
-                "content": content,
-                "timestamp": datetime.utcnow().isoformat()
-            })
-            return content
-        except Exception as e:
-            logging.error(f"Error generating content: {e}")
-            return None
 
-    async def Openai_Call(self, prompt: str) -> Optional[str]:
-        """Faz uma chamada à API do OpenAI com tratamento de erros e fallback."""
-        try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens
+        bundle_path = self.storage.save_bundle(
+            student_id=student.id,
+            topic=topic,
+            prompt_version=prompt_version,
+            model=self.model,
+            results=results,
+        )
+
+        return {
+            "student_id": student.id,
+            "topic": topic,
+            "prompt_version": prompt_version,
+            "model": self.model,
+            "types": list(CONTENT_TYPES),
+            "results": results,
+            "bundle_file": bundle_path,
+        }
+
+    async def compare_prompt_versions(
+        self,
+        student: Student,
+        topic: str,
+        content_type: str,
+        versions: Iterable[str] = ("v1", "v2"),
+        use_cache: bool = False,
+    ) -> Dict[str, Any]:
+        comparison: Dict[str, Any] = {
+            "student_id": student.id,
+            "topic": topic,
+            "content_type": content_type,
+            "model": self.model,
+            "versions": {},
+        }
+
+        for version in versions:
+            comparison["versions"][version] = await self.generate_content(
+                student=student,
+                topic=topic,
+                content_type=content_type,
+                prompt_version=version,
+                use_cache=use_cache,
             )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            logging.error(f"Error with model {self.model}: {e}")
-            if self.fallback_model and self.fallback_model != self.model:
-                logging.info(f"Attempting fallback with model {self.fallback_model}")
-                try:
-                    response = await self.client.chat.completions.create(
-                        model=self.fallback_model,
-                        messages=[{"role": "system", "content": "You are an educational assistant."},
-                                  {"role": "user", "content": prompt}]
-                    )
-                    return response.choices[0].message.content.strip()
-                except Exception as e:
-                    logging.error(f"Error with fallback model {self.fallback_model}: {e}")
-            return None
 
-    async def generate_comparison(self, student: Student, topic: str, types: list) -> Dict[str, Any]:
-        """Gera uma comparação entre diferentes tipos de conteúdo para o mesmo tópico."""
-        results = {}
-        for content_type in types:
-            content = await self.generate_content(student, topic, content_type)
-            if content:
-                results[content_type] = content
-        return results
+        comparison_file = self.storage.save_comparison(
+            student_id=student.id,
+            topic=topic,
+            content_type=content_type,
+            comparison=comparison,
+        )
+        comparison["comparison_file"] = comparison_file
+        return comparison
 
-    def comparsion_analyse(self, comparison: Dict[str, Any]) -> str:
-        """Analisa os resultados da comparação e gera um resumo das diferenças e semelhanças."""
-        analysis = "Comparison Analysis:\n"
-        for content_type, content in comparison.items():
-            analysis += f"\n--- {content_type} ---\n{content}\n"
-        return analysis
 
+# Backward-compatible alias for existing imports.
+Generator = ContentGenerator
